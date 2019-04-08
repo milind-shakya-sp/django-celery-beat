@@ -1,5 +1,6 @@
 from __future__ import absolute_import, unicode_literals
 
+import math
 import time
 import pytest
 
@@ -8,7 +9,8 @@ from itertools import count
 
 from django.contrib.admin.sites import AdminSite
 from django.contrib.messages.storage.fallback import FallbackStorage
-from django.test import RequestFactory
+from django.test import RequestFactory, override_settings
+from django.utils import timezone
 
 from celery.five import monotonic, text_t
 from celery.schedules import schedule, crontab, solar
@@ -96,6 +98,8 @@ class SchedulerCase:
             kwargs='{"callback": "foo"}',
             queue='xaz',
             routing_key='cpu',
+            priority=1,
+            headers='{"_schema_name": "foobar"}',
             exchange='foo',
         )
         return Model(**dict(entry, **kwargs))
@@ -117,6 +121,8 @@ class test_ModelEntry(SchedulerCase):
         assert e.options['queue'] == 'xaz'
         assert e.options['exchange'] == 'foo'
         assert e.options['routing_key'] == 'cpu'
+        assert e.options['priority'] == 1
+        assert e.options['headers'] == {'_schema_name': 'foobar'}
 
         right_now = self.app.now()
         m2 = self.create_model_interval(
@@ -131,6 +137,27 @@ class test_ModelEntry(SchedulerCase):
         e3 = e2.next()
         assert e3.last_run_at > e2.last_run_at
         assert e3.total_run_count == 1
+
+    @override_settings(
+        USE_TZ=False,
+        DJANGO_CELERY_BEAT_TZ_AWARE=False
+    )
+    @timezone.override('Europe/Berlin')
+    @pytest.mark.celery(timezone='Europe/Berlin')
+    def test_entry_is_due__no_use_tz(self):
+        assert self.app.timezone.zone == 'Europe/Berlin'
+
+        # simulate last_run_at from DB - not TZ aware but localtime
+        right_now = timezone.now()
+
+        m = self.create_model_crontab(
+            crontab(minute='*/10'),
+            last_run_at=right_now,
+        )
+        e = self.Entry(m, app=self.app)
+
+        assert e.is_due().is_due is False
+        assert e.is_due().next <= 600  # 10 minutes; see above
 
     def test_task_with_start_time(self):
         interval = 10
@@ -151,7 +178,7 @@ class test_ModelEntry(SchedulerCase):
         e2 = self.Entry(m2, app=self.app)
         isdue, delay = e2.is_due()
         assert not isdue
-        assert delay == interval
+        assert delay == math.ceil((tomorrow - right_now).total_seconds())
 
     def test_one_off_task(self):
         interval = 10

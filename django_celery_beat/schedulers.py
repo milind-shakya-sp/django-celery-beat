@@ -3,6 +3,7 @@ from __future__ import absolute_import, unicode_literals
 
 import datetime
 import logging
+import math
 
 from multiprocessing.util import Finalize
 
@@ -85,6 +86,7 @@ class ModelEntry(ScheduleEntry):
             if value is None:
                 continue
             self.options[option] = value
+        self.options['headers'] = loads(model.headers or '{}')
 
         self.total_run_count = model.total_run_count
         self.model = model
@@ -92,12 +94,7 @@ class ModelEntry(ScheduleEntry):
         if not model.last_run_at:
             model.last_run_at = self._default_now()
 
-        last_run_at = model.last_run_at
-
-        if getattr(settings, 'DJANGO_CELERY_BEAT_TZ_AWARE', True):
-            last_run_at = make_aware(last_run_at)
-
-        self.last_run_at = last_run_at
+        self.last_run_at = model.last_run_at
 
     def _disable(self, model):
         model.no_changes = True
@@ -111,10 +108,16 @@ class ModelEntry(ScheduleEntry):
 
         # START DATE: only run after the `start_time`, if one exists.
         if self.model.start_time is not None:
-            if maybe_make_aware(self._default_now()) < self.model.start_time:
+            now = self._default_now()
+            if getattr(settings, 'DJANGO_CELERY_BEAT_TZ_AWARE', True):
+                now = maybe_make_aware(self._default_now())
+
+            if now < self.model.start_time:
                 # The datetime is before the start date - don't run.
-                _, delay = self.schedule.is_due(self.last_run_at)
-                # use original delay for re-check
+                # send a delay to retry on start_time
+                delay = math.ceil(
+                    (self.model.start_time - now).total_seconds()
+                )
                 return schedules.schedstate(False, delay)
 
         # ONE OFF TASK: Disable one off tasks after they've ran once
@@ -126,15 +129,17 @@ class ModelEntry(ScheduleEntry):
             self.model.save()
             return schedules.schedstate(False, None)  # Don't recheck
 
-        return self.schedule.is_due(self.last_run_at)
+        return self.schedule.is_due(make_aware(self.last_run_at))
 
     def _default_now(self):
-        now = self.app.now()
         # The PyTZ datetime must be localised for the Django-Celery-Beat
         # scheduler to work. Keep in mind that timezone arithmatic
         # with a localized timezone may be inaccurate.
         if getattr(settings, 'DJANGO_CELERY_BEAT_TZ_AWARE', True):
+            now = self.app.now()
             now = now.tzinfo.localize(now.replace(tzinfo=None))
+        else:
+            now = datetime.datetime.now()
         return now
 
     def __next__(self):
@@ -188,12 +193,13 @@ class ModelEntry(ScheduleEntry):
 
     @classmethod
     def _unpack_options(cls, queue=None, exchange=None, routing_key=None,
-                        priority=None, **kwargs):
+                        priority=None, headers=None, **kwargs):
         return {
             'queue': queue,
             'exchange': exchange,
             'routing_key': routing_key,
-            'priority': priority
+            'priority': priority,
+            'headers': dumps(headers or {}),
         }
 
     def __repr__(self):
