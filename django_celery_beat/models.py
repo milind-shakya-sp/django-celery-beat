@@ -2,6 +2,7 @@
 from __future__ import absolute_import, unicode_literals
 
 from datetime import timedelta
+import dateutil
 
 import timezone_field
 from celery import schedules
@@ -42,7 +43,11 @@ def cronexp(field):
 
 
 class CeleryMySQLIndex(Index):
-    def create_sql(self, model, schema_editor, using=''):
+
+    def _is_mysql_backend(self, connection):
+        return connection.vendor.startswith('mysql')
+
+    def _create_sql(self, model, schema_editor, using=''):
         sql_create_index = 'CREATE INDEX %(name)s ON %(table)s (%(columns)s(%(size)d))%(extra)s'
         sql_parameters = self.get_sql_create_template_values(
             model,
@@ -56,6 +61,12 @@ class CeleryMySQLIndex(Index):
         )
         sql = sql_create_index % sql_parameters
         return sql
+
+    def create_sql(self, model, schema_editor, using=''):
+        if self._is_mysql_backend(schema_editor.connection):
+            return self._create_sql(model, schema_editor, using=using)
+        else:
+            return super(CeleryMySQLIndex, self).create_sql(model, schema_editor, using=using)
 
 
 @python_2_unicode_compatible
@@ -115,6 +126,21 @@ class TZNaiveSchedule(schedules.schedule):
         Overriding the base method, to be a no-op and returning the dt as is.
         """
         return dt
+
+
+def maybe_make_naive(dt):
+    if dt and dt.tzinfo:
+        dt = dt.replace(tzinfo=None)
+    return dt
+
+
+class TZNaiveCronSchedule(schedules.crontab):
+
+    def maybe_make_aware(self, dt):
+        """
+        Overriding the base method, to be a no-op and returning the dt as is.
+        """
+        return maybe_make_naive(dt)
 
 
 @python_2_unicode_compatible
@@ -225,7 +251,7 @@ class CrontabSchedule(models.Model):
 
     @property
     def schedule(self):
-        crontab = schedules.crontab(
+        crontab = TZNaiveCronSchedule(
             minute=self.minute,
             hour=self.hour,
             day_of_week=self.day_of_week,
